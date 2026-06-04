@@ -461,6 +461,19 @@ def main():
         st.caption("• Hunter.io free: 25 emails/month")
         st.caption("• Pipeline takes 10-15 mins to run")
 
+        # Always visible download button in sidebar
+        if st.session_state.get("excel_bytes"):
+            st.divider()
+            st.success("✅ Pipeline complete!")
+            st.download_button(
+                "📥 Download Excel Now",
+                data=st.session_state["excel_bytes"],
+                file_name=f"JobPipeline_{datetime.now().strftime('%Y-%m-%d')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="sidebar_download"
+            )
+
     # ── Main: Pipeline ──
     if not st.session_state.get("apify_key") or not st.session_state.get("claude_key") or not st.session_state.get("master_resume"):
         st.warning("👈 Add your Apify key, Claude API key, and resume in the sidebar first. Then click Save Configuration.")
@@ -551,7 +564,7 @@ def main():
 
             email_total = sum(1 for j in jobs6 for c in j.get("contacts", []) if c.get("email"))
             status_area.success(f"✅ Pipeline complete! {len(jobs6)} jobs · {email_total} direct emails · {len(jobs6)} Resume Tailor prompts ready")
-            st.rerun()
+            st.balloons()
 
         except Exception as e:
             status_area.error(f"❌ Pipeline error: {str(e)}")

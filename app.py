@@ -8,18 +8,11 @@ import re
 import unicodedata
 from datetime import datetime
 import openpyxl
-from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.styles import Font, PatternFill
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 st.set_page_config(page_title="Daily Job Pipeline", page_icon="🚀", layout="wide")
-
-st.markdown("""
-<style>
-.stage-done { border-color: #4caf50; background: #f0fff0; }
-.stage-active { border-color: #2196f3; background: #f0f8ff; }
-</style>
-""", unsafe_allow_html=True)
 
 APIFY_BASE = "https://api.apify.com/v2"
 HUNTER_BASE = "https://api.hunter.io/v2"
@@ -29,41 +22,38 @@ SEARCH_QUERIES = [
     "Senior Product Manager API Platform LLM Generative AI B2B SaaS 2026",
     "Director Product Manager Enterprise AI Security Compliance Platform 2026",
     "Principal Product Manager Platform Identity Security Cloud 2026",
-    "Senior PM Fintech AI Products Authentication enterprise 2026"
 ]
 
-# ── Text cleaning ──────────────────────────────────────────────────
+# ── Bulletproof text cleaner ───────────────────────────────────────
 
-def clean(text):
-    if not text:
+def clean(val):
+    """Remove ALL non-ASCII characters. Foolproof."""
+    if val is None:
         return ""
-    if not isinstance(text, str):
+    if not isinstance(val, str):
         try:
-            text = str(text)
+            val = str(val)
         except Exception:
             return ""
-    text = unicodedata.normalize("NFKD", text)
-    replacements = {
-        "\u2028": " ", "\u2029": " ", "\u200b": "", "\u200c": "",
-        "\u200d": "", "\ufeff": "", "\u00a0": " ", "\u2013": "-",
-        "\u2014": "-", "\u2018": "'", "\u2019": "'", "\u201c": '"',
-        "\u201d": '"', "\u2026": "...", "\u2022": "-", "\u00b7": ".",
-    }
-    for char, rep in replacements.items():
-        text = text.replace(char, rep)
-    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", "", text)
-    text = text.encode("ascii", "ignore").decode("ascii")
-    return text.strip()
+    # Keep only characters with ordinal < 128
+    return "".join(c for c in val if ord(c) < 128).strip()
 
 def deep_clean(obj):
+    """Recursively clean every string in dicts and lists."""
     if isinstance(obj, str):
         return clean(obj)
-    elif isinstance(obj, dict):
+    if isinstance(obj, dict):
         return {k: deep_clean(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [deep_clean(item) for item in obj]
-    else:
-        return obj
+    if isinstance(obj, list):
+        return [deep_clean(i) for i in obj]
+    return obj
+
+def safe_str(val, limit=None):
+    """Convert to clean ASCII string, optionally truncated."""
+    result = clean(str(val) if val is not None else "")
+    if limit:
+        result = result[:limit]
+    return result
 
 # ── API helpers ────────────────────────────────────────────────────
 
@@ -83,21 +73,31 @@ def run_apify(actor, input_data, apify_key, timeout=300):
     deadline = time.time() + timeout
     while time.time() < deadline:
         time.sleep(5)
-        sr = requests.get(APIFY_BASE + "/actor-runs/" + run_id, headers=headers, timeout=15)
-        status = sr.json()["data"]["status"]
+        sr = requests.get(
+            APIFY_BASE + "/actor-runs/" + run_id,
+            headers=headers,
+            timeout=15
+        )
+        data = sr.json()["data"]
+        status = data["status"]
         if status == "SUCCEEDED":
-            dataset_id = sr.json()["data"]["defaultDatasetId"]
+            dataset_id = data["defaultDatasetId"]
             items = requests.get(
                 APIFY_BASE + "/datasets/" + dataset_id + "/items?limit=100",
                 headers=headers,
                 timeout=30
             )
-            return items.json()
+            raw_items = items.json()
+            # Deep clean all scraped data immediately
+            return [deep_clean(item) for item in raw_items]
         if status in ("FAILED", "ABORTED"):
             raise RuntimeError("Apify run " + status)
     raise TimeoutError("Apify run timed out")
 
 def call_claude(system, user, api_key):
+    # Clean inputs before sending
+    system = clean(system)
+    user = clean(user)
     client = anthropic.Anthropic(api_key=api_key)
     msg = client.messages.create(
         model="claude-sonnet-4-20250514",
@@ -105,12 +105,13 @@ def call_claude(system, user, api_key):
         system=system,
         messages=[{"role": "user", "content": user}]
     )
-    return msg.content[0].text
+    result = msg.content[0].text
+    return clean(result)
 
 def parse_json_safe(text):
     try:
-        clean_text = text.replace("```json", "").replace("```", "").strip()
-        return json.loads(clean_text)
+        cleaned = text.replace("```json", "").replace("```", "").strip()
+        return json.loads(cleaned)
     except Exception:
         return None
 
@@ -120,21 +121,28 @@ def hunter_find_email(first, last, company, hunter_key):
     try:
         resp = requests.get(
             HUNTER_BASE + "/email-finder",
-            params={"company": company, "first_name": first, "last_name": last, "api_key": hunter_key},
+            params={
+                "company": company,
+                "first_name": first,
+                "last_name": last,
+                "api_key": hunter_key
+            },
             timeout=10
         )
         data = resp.json()
         email = data.get("data", {}).get("email")
         if email:
             score = data["data"].get("score", 0)
-            return {"email": email, "score": score, "verified": score > 70}
+            return {"email": clean(email), "score": score, "verified": score > 70}
     except Exception:
         pass
     return None
 
 def parse_name(full_name):
-    parts = (full_name or "").strip().split()
-    return (parts[0] if parts else ""), (" ".join(parts[1:]) if len(parts) > 1 else "")
+    parts = clean(full_name or "").split()
+    first = parts[0] if parts else ""
+    last = " ".join(parts[1:]) if len(parts) > 1 else ""
+    return first, last
 
 def get_secret(key, env_key):
     if st.session_state.get(key):
@@ -147,89 +155,120 @@ def get_secret(key, env_key):
 # ── Pipeline stages ────────────────────────────────────────────────
 
 def stage_discover(apify_key, claude_key, status_placeholder):
-    status_placeholder.info("Searching Greenhouse, Ashby, Lever, LinkedIn, Google Jobs...")
+    status_placeholder.info("Stage 1/7: Searching job boards...")
     all_results = []
     with ThreadPoolExecutor(max_workers=3) as ex:
-        futures = {ex.submit(run_apify, "apify/rag-web-browser", {"query": q, "maxResults": 5}, apify_key, 180): q for q in SEARCH_QUERIES[:4]}
+        futures = {
+            ex.submit(run_apify, "apify/rag-web-browser", {"query": q, "maxResults": 5}, apify_key, 180): i
+            for i, q in enumerate(SEARCH_QUERIES[:4])
+        }
         for i, future in enumerate(as_completed(futures)):
-            status_placeholder.info("Scraping job boards... (" + str(i+1) + "/4 queries complete)")
+            status_placeholder.info("Stage 1/7: Scraped " + str(i+1) + " of 4 queries...")
             try:
-                all_results.extend(future.result() or [])
-            except Exception:
-                pass
-    content = "\n---\n".join([
-        "SOURCE: " + str(r.get("url","")) + "\nTITLE: " + str(r.get("title","")) + "\nCONTENT: " + str(r.get("text",""))[:500]
-        for r in all_results
-    ])
-    content = clean(content)
-    status_placeholder.info("AI extracting structured job listings...")
-    raw = call_claude(
-        "Extract job listings from web search results. Return ONLY valid JSON array, nothing else.",
-        'Extract all PM job listings. Return array: [{"title":"","company":"","url":"","description":"","location":"","postedDate":""}]\n\nContent:\n' + content[:8000],
-        claude_key
-    )
+                results = future.result() or []
+                all_results.extend(results)
+            except Exception as e:
+                st.warning("Query failed: " + str(e))
+
+    # Build content string from already-cleaned results
+    parts = []
+    for r in all_results:
+        url = safe_str(r.get("url",""), 200)
+        title = safe_str(r.get("title",""), 100)
+        text = safe_str(r.get("text",""), 500)
+        parts.append("SOURCE: " + url + "\nTITLE: " + title + "\nCONTENT: " + text)
+    content = "\n---\n".join(parts)
+
+    status_placeholder.info("Stage 1/7: AI extracting job listings...")
+    system = "Extract job listings from web search results. Return ONLY valid JSON array, nothing else."
+    user = ('Extract all PM job listings. Return array: '
+            '[{"title":"","company":"","url":"","description":"","location":"","postedDate":""}]'
+            "\n\nContent:\n" + content[:8000])
+
+    raw = call_claude(system, user, claude_key)
     jobs = parse_json_safe(raw)
-    result = [j for j in (jobs or []) if j.get("title") and j.get("company")]
-    return [deep_clean(j) for j in result]
+    if not isinstance(jobs, list):
+        return []
+    result = [deep_clean(j) for j in jobs if j.get("title") and j.get("company")]
+    return result
+
 
 def stage_score(jobs, resume, claude_key, status_placeholder):
-    status_placeholder.info("Scoring " + str(len(jobs)) + " jobs against your resume...")
+    status_placeholder.info("Stage 2/7: Scoring " + str(len(jobs)) + " jobs...")
+    clean_resume = safe_str(resume, 1200)
+
     def score_job(j):
-        raw = call_claude(
-            "Score job match. Return ONLY valid JSON, nothing else.",
-            "Resume: " + resume[:1200] + "\n\nJob: " + j.get("title","") + " at " + j.get("company","") + "\nDesc: " + str(j.get("description",""))[:700] + '\n\nReturn: {"score":8.5,"domain":9,"seniority":8,"technical":8,"ai_relevance":9,"match_reason":"2 sentences on why strong match","gap":"1 sentence or none","competition":"low/medium/high","sponsorship":"confirmed/likely/unknown/no","angle":"what to emphasize in application"}',
-            claude_key
-        )
+        title = safe_str(j.get("title",""))
+        company = safe_str(j.get("company",""))
+        desc = safe_str(j.get("description",""), 700)
+        system = "Score job match. Return ONLY valid JSON, nothing else."
+        user = ("Resume: " + clean_resume + "\n\nJob: " + title + " at " + company +
+                "\nDesc: " + desc +
+                '\n\nReturn: {"score":8.5,"domain":9,"seniority":8,"technical":8,'
+                '"ai_relevance":9,"match_reason":"2 sentences","gap":"1 sentence or none",'
+                '"competition":"low/medium/high","sponsorship":"confirmed/likely/unknown/no",'
+                '"angle":"what to emphasize"}')
+        raw = call_claude(system, user, claude_key)
         parsed = parse_json_safe(raw)
-        result = {**j, **(parsed or {"score": 0})}
-        return deep_clean(result)
+        merged = {**j, **(parsed or {"score": 0})}
+        return deep_clean(merged)
+
     scored = []
     with ThreadPoolExecutor(max_workers=4) as ex:
         scored = list(ex.map(score_job, jobs[:20]))
-    return sorted([j for j in scored if j.get("score", 0) >= 7.5], key=lambda x: x.get("score", 0), reverse=True)[:8]
+
+    return sorted(
+        [j for j in scored if j.get("score", 0) >= 7.5],
+        key=lambda x: x.get("score", 0),
+        reverse=True
+    )[:8]
+
 
 def stage_contacts(jobs, apify_key, claude_key, status_placeholder):
-    status_placeholder.info("Finding VPs, Directors, Recruiters at each company...")
+    status_placeholder.info("Stage 3/7: Finding decision makers...")
     result_jobs = []
     for i, job in enumerate(jobs):
-        status_placeholder.info("Finding decision makers at " + job.get("company","") + " (" + str(i+1) + "/" + str(len(jobs)) + ")...")
+        company = safe_str(job.get("company",""))
+        status_placeholder.info("Stage 3/7: Finding contacts at " + company + " (" + str(i+1) + "/" + str(len(jobs)) + ")...")
         try:
-            results = run_apify(
-                "apify/rag-web-browser",
-                {"query": '"' + job.get("company","") + '" "VP Product" OR "Director Product" OR "Head of Product" OR "Technical Recruiter" site:linkedin.com', "maxResults": 5},
-                apify_key, 120
-            )
-            content = "\n".join([str(r.get("title","")) + " | " + str(r.get("url","")) for r in (results or [])])
-            content = clean(content)
-            raw = call_claude(
-                "Extract LinkedIn contacts. Return ONLY valid JSON array.",
-                'Find people at ' + job.get("company","") + '. Return: [{"name":"Full Name","title":"","linkedInUrl":"","priority":"high/medium/low"}]\nPriority: VP/Director/Head Product=high, Recruiter=medium, PM=low\n\nResults:\n' + content,
-                claude_key
-            )
+            query = '"' + company + '" "VP Product" OR "Director Product" OR "Head of Product" OR "Technical Recruiter" site:linkedin.com'
+            results = run_apify("apify/rag-web-browser", {"query": query, "maxResults": 5}, apify_key, 120)
+            lines = []
+            for r in (results or []):
+                lines.append(safe_str(r.get("title",""), 100) + " | " + safe_str(r.get("url",""), 200))
+            content = "\n".join(lines)
+            system = "Extract LinkedIn contacts. Return ONLY valid JSON array."
+            user = ('Find people at ' + company + '. Return: '
+                   '[{"name":"Full Name","title":"","linkedInUrl":"","priority":"high/medium/low"}]\n'
+                   'Priority: VP/Director/Head Product=high, Recruiter=medium, PM=low\n\n'
+                   'Results:\n' + content)
+            raw = call_claude(system, user, claude_key)
             contacts = parse_json_safe(raw)
-            cleaned_contacts = [deep_clean(c) for c in (contacts or [])[:5]]
-            result_jobs.append({**job, "contacts": cleaned_contacts})
-        except Exception:
+            cleaned = [deep_clean(c) for c in (contacts or [])[:5]]
+            result_jobs.append({**job, "contacts": cleaned})
+        except Exception as e:
             result_jobs.append({**job, "contacts": []})
     return result_jobs
 
+
 def stage_enrich_emails(jobs, hunter_key, status_placeholder):
     if not hunter_key:
-        status_placeholder.warning("No Hunter.io key — skipping email enrichment")
+        status_placeholder.warning("Stage 4/7: No Hunter.io key — skipping email enrichment")
         time.sleep(1)
         return jobs
-    status_placeholder.info("Looking up direct emails via Hunter.io...")
+    status_placeholder.info("Stage 4/7: Finding direct emails via Hunter.io...")
     found, total = 0, 0
     enriched_jobs = []
     for job in jobs:
+        company = safe_str(job.get("company",""))
         enriched_contacts = []
         for contact in job.get("contacts", []):
             total += 1
             first, last = parse_name(contact.get("name", ""))
-            result = hunter_find_email(first, last, job.get("company",""), hunter_key)
+            result = hunter_find_email(first, last, company, hunter_key)
             if result:
                 found += 1
-            status_placeholder.info("Hunter.io: " + str(found) + " emails found of " + str(total) + " searched...")
+            status_placeholder.info("Stage 4/7: Hunter.io — " + str(found) + " emails found of " + str(total) + " searched...")
             enriched_contacts.append({
                 **contact,
                 "email": result["email"] if result else None,
@@ -237,110 +276,121 @@ def stage_enrich_emails(jobs, hunter_key, status_placeholder):
                 "email_verified": result["verified"] if result else False
             })
         enriched_jobs.append({**job, "contacts": enriched_contacts})
-    status_placeholder.success("Hunter.io complete: " + str(found) + " direct emails found")
+    status_placeholder.success("Stage 4/7: Done — " + str(found) + " direct emails found")
     return enriched_jobs
 
+
 def stage_drafts(jobs, resume, claude_key, status_placeholder):
-    status_placeholder.info("Writing personalized outreach emails...")
+    status_placeholder.info("Stage 5/7: Writing personalized outreach emails...")
+    clean_resume = safe_str(resume, 350)
     result_jobs = []
     for job in jobs:
+        title = safe_str(job.get("title",""))
+        company = safe_str(job.get("company",""))
         enriched_contacts = []
         for contact in job.get("contacts", []):
             try:
-                draft = call_claude(
-                    "Write a short cold outreach email. No hyphens. No bullet points. Max 4 sentences. Human and specific. No I am excited to. Return email body only.",
-                    "Sender background: " + resume[:350] + "\nTo: " + contact.get("name","") + ", " + contact.get("title","") + " at " + job.get("company","") + "\nApplying for: " + job.get("title","") + "\n\nWrite email body:",
-                    claude_key
-                )
-                enriched_contacts.append({**contact, "email_draft": clean(draft.strip())})
+                name = safe_str(contact.get("name",""))
+                ctitle = safe_str(contact.get("title",""))
+                system = "Write a short cold outreach email. No hyphens. No bullet points. Max 4 sentences. Human and specific. No I am excited to. Return email body only."
+                user = ("Sender background: " + clean_resume +
+                       "\nTo: " + name + ", " + ctitle + " at " + company +
+                       "\nApplying for: " + title + "\n\nWrite email body:")
+                draft = call_claude(system, user, claude_key)
+                enriched_contacts.append({**contact, "email_draft": draft})
             except Exception:
                 enriched_contacts.append({**contact, "email_draft": ""})
         result_jobs.append({**job, "contacts": enriched_contacts})
     return result_jobs
 
+
 def stage_resumes(jobs, status_placeholder):
-    status_placeholder.info("Generating Resume Tailor prompts for each role...")
+    status_placeholder.info("Stage 6/7: Generating Resume Tailor prompts...")
     result_jobs = []
     for job in jobs:
-        prompt = (
-            "Tailor my resume for this role.\n\n"
-            "Company: " + job.get("company", "") + "\n"
-            "Role: " + job.get("title", "") + "\n"
-            "Apply Link: " + job.get("url", "") + "\n\n"
-            "Job Description:\n" + job.get("description", "Not available") + "\n\n"
-            "Key angle to emphasize: " + job.get("angle", "") + "\n"
-            "Known gap to address: " + job.get("gap", "") + "\n\n"
-            "Instructions:\n"
-            "- Match keywords until score is above 90%\n"
-            "- Rewrite bullets using their exact language\n"
-            "- Flag any ATS keyword gaps\n"
-            "- Tell me what to add if a new gap is found\n"
-            "- Update memory with any new instructions"
-        )
-        result_jobs.append({**job, "resume_tailor_prompt": clean(prompt)})
-    status_placeholder.success("Resume Tailor prompts ready")
+        company = safe_str(job.get("company",""))
+        title = safe_str(job.get("title",""))
+        url = safe_str(job.get("url",""))
+        desc = safe_str(job.get("description",""), 2000)
+        angle = safe_str(job.get("angle",""))
+        gap = safe_str(job.get("gap",""))
+        prompt = ("Tailor my resume for this role.\n\n"
+                 "Company: " + company + "\n"
+                 "Role: " + title + "\n"
+                 "Apply Link: " + url + "\n\n"
+                 "Job Description:\n" + (desc or "Not available") + "\n\n"
+                 "Key angle to emphasize: " + angle + "\n"
+                 "Known gap to address: " + gap + "\n\n"
+                 "Instructions:\n"
+                 "- Match keywords until score is above 90%\n"
+                 "- Rewrite bullets using their exact language\n"
+                 "- Flag any ATS keyword gaps\n"
+                 "- Tell me what to add if a new gap is found\n"
+                 "- Update memory with any new instructions")
+        result_jobs.append({**job, "resume_tailor_prompt": prompt})
     return result_jobs
+
 
 def generate_excel(jobs):
     wb = openpyxl.Workbook()
     today = datetime.now().strftime("%Y-%m-%d")
-    header_font = Font(bold=True, color="FFFFFF")
-    header_fill = PatternFill("solid", fgColor="1a73e8")
+    hf = Font(bold=True, color="FFFFFF")
+    hfill = PatternFill("solid", fgColor="1a73e8")
 
     ws1 = wb.active
     ws1.title = "Jobs"
-    h1 = ["Date","Rank","Company","Role","Match Score","Domain","Seniority","Technical","AI Relevance","Apply Link","Competition","Sponsorship","Why Match","Gap to Address","Tailoring Angle","Status","Notes"]
-    ws1.append(h1)
+    ws1.append(["Date","Rank","Company","Role","Match Score","Competition","Sponsorship","Why Match","Gap","Angle","Apply Link","Status","Notes"])
     for cell in ws1[1]:
-        cell.font = header_font
-        cell.fill = header_fill
-
-    for i, job in enumerate(jobs):
+        cell.font = hf
+        cell.fill = hfill
+    for i, j in enumerate(jobs):
         ws1.append([
             today, i+1,
-            clean(job.get("company","")), clean(job.get("title","")),
-            job.get("score",""), job.get("domain",""), job.get("seniority",""),
-            job.get("technical",""), job.get("ai_relevance",""),
-            clean(job.get("url","")), clean(job.get("competition","")),
-            clean(job.get("sponsorship","")), clean(job.get("match_reason","")),
-            clean(job.get("gap","")), clean(job.get("angle","")),
+            safe_str(j.get("company","")),
+            safe_str(j.get("title","")),
+            j.get("score",""),
+            safe_str(j.get("competition","")),
+            safe_str(j.get("sponsorship","")),
+            safe_str(j.get("match_reason","")),
+            safe_str(j.get("gap","")),
+            safe_str(j.get("angle","")),
+            safe_str(j.get("url","")),
             "Not Applied", ""
         ])
 
     ws2 = wb.create_sheet("Contacts and Emails")
-    h2 = ["Date","Company","Role","Contact Name","Contact Title","Direct Email","Email Confidence","Email Verified","LinkedIn URL","Priority","Outreach Email Draft","Sent?"]
-    ws2.append(h2)
+    ws2.append(["Date","Company","Role","Contact Name","Contact Title","Direct Email","Confidence","Verified","LinkedIn","Priority","Email Draft","Sent?"])
     for cell in ws2[1]:
-        cell.font = header_font
-        cell.fill = header_fill
-
-    for job in jobs:
-        for contact in job.get("contacts", []):
+        cell.font = hf
+        cell.fill = hfill
+    for j in jobs:
+        for c in j.get("contacts", []):
+            score = c.get("email_score")
             ws2.append([
                 today,
-                clean(job.get("company","")), clean(job.get("title","")),
-                clean(contact.get("name","")), clean(contact.get("title","")),
-                clean(contact.get("email","Not found")),
-                str(contact.get("email_score","")) + "%" if contact.get("email_score") else "",
-                "Yes" if contact.get("email_verified") else "",
-                clean(contact.get("linkedInUrl","")),
-                clean(contact.get("priority","")),
-                clean(contact.get("email_draft","")),
+                safe_str(j.get("company","")),
+                safe_str(j.get("title","")),
+                safe_str(c.get("name","")),
+                safe_str(c.get("title","")),
+                safe_str(c.get("email","Not found")),
+                (str(score) + "%") if score else "",
+                "Yes" if c.get("email_verified") else "",
+                safe_str(c.get("linkedInUrl","")),
+                safe_str(c.get("priority","")),
+                safe_str(c.get("email_draft","")),
                 "No"
             ])
 
     ws3 = wb.create_sheet("Resume Tailor Prompts")
-    h3 = ["Company","Role","Paste Into Resume Tailor Project"]
-    ws3.append(h3)
+    ws3.append(["Company","Role","Paste Into Resume Tailor Project"])
     for cell in ws3[1]:
-        cell.font = header_font
-        cell.fill = header_fill
-
-    for job in jobs:
+        cell.font = hf
+        cell.fill = hfill
+    for j in jobs:
         ws3.append([
-            clean(job.get("company","")),
-            clean(job.get("title","")),
-            clean(job.get("resume_tailor_prompt",""))
+            safe_str(j.get("company","")),
+            safe_str(j.get("title","")),
+            safe_str(j.get("resume_tailor_prompt",""))
         ])
 
     for ws in [ws1, ws2, ws3]:
@@ -352,6 +402,7 @@ def generate_excel(jobs):
     buf.seek(0)
     return buf.getvalue()
 
+
 # ── Main UI ────────────────────────────────────────────────────────
 
 def main():
@@ -360,12 +411,16 @@ def main():
 
     with st.sidebar:
         st.header("Configuration")
-        st.caption("Keys stored in session only.")
-
-        apify_key = st.text_input("Apify API Key", type="password", value=get_secret("apify_key", "APIFY_KEY"), help="apify.com → Settings → API & Integrations")
-        claude_key = st.text_input("Claude API Key", type="password", value=get_secret("claude_key", "ANTHROPIC_API_KEY"), help="console.anthropic.com → API Keys")
-        hunter_key = st.text_input("Hunter.io API Key", type="password", value=get_secret("hunter_key", "HUNTER_KEY"), help="hunter.io → Dashboard → API Key (optional)")
-        master_resume = st.text_area("Master Resume", value=st.session_state.get("master_resume", ""), height=200)
+        apify_key = st.text_input("Apify API Key", type="password",
+            value=get_secret("apify_key", "APIFY_KEY"),
+            help="apify.com → Settings → API & Integrations")
+        claude_key = st.text_input("Claude API Key", type="password",
+            value=get_secret("claude_key", "ANTHROPIC_API_KEY"),
+            help="console.anthropic.com → API Keys")
+        hunter_key = st.text_input("Hunter.io API Key (optional)", type="password",
+            value=get_secret("hunter_key", "HUNTER_KEY"),
+            help="hunter.io → Dashboard → API Key")
+        master_resume = st.text_area("Master Resume", value=st.session_state.get("master_resume",""), height=200)
 
         if st.button("Save Configuration", use_container_width=True):
             st.session_state["apify_key"] = apify_key
@@ -383,51 +438,46 @@ def main():
                 file_name="JobPipeline_" + datetime.now().strftime("%Y-%m-%d") + ".xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
-                key="sidebar_download"
+                key="sidebar_dl"
             )
 
         st.divider()
-        st.caption("Tips:")
-        st.caption("Apify free tier works for testing")
+        st.caption("Tips")
         st.caption("Claude API key from console.anthropic.com")
-        st.caption("Hunter.io free: 25 emails/month")
-        st.caption("Pipeline takes 10-15 mins to run")
+        st.caption("Hunter.io free tier: 25 emails/month")
+        st.caption("Pipeline takes 10 to 15 minutes")
 
-    ak = st.session_state.get("apify_key", "")
-    ck = st.session_state.get("claude_key", "")
-    hk = st.session_state.get("hunter_key", "")
-    resume = st.session_state.get("master_resume", "")
+    ak = st.session_state.get("apify_key","")
+    ck = st.session_state.get("claude_key","")
+    hk = st.session_state.get("hunter_key","")
+    resume = st.session_state.get("master_resume","")
 
     if not ak or not ck or not resume:
-        st.warning("Add your Apify key, Claude API key, and resume in the sidebar first. Then click Save Configuration.")
+        st.warning("Add your Apify key, Claude API key, and resume in the sidebar. Then click Save Configuration.")
         return
 
-    col1, col2 = st.columns([3, 1])
+    col1, col2 = st.columns([3,1])
     with col1:
         st.subheader("Pipeline Stages")
     with col2:
         run_clicked = st.button("Run Pipeline", type="primary", use_container_width=True)
 
     stages = [
-        ("discover", "Discover jobs"),
-        ("score", "Score matches"),
-        ("contacts", "Find decision makers"),
-        ("emails", "Enrich emails via Hunter.io"),
-        ("drafts", "Write outreach drafts"),
-        ("resume", "Generate Resume Tailor prompts"),
-        ("export", "Generate spreadsheet")
+        "Discover jobs", "Score matches", "Find decision makers",
+        "Enrich emails", "Write outreach drafts",
+        "Generate Resume Tailor prompts", "Generate spreadsheet"
     ]
+    stage_ids = ["discover","score","contacts","emails","drafts","resume","export"]
 
-    done = st.session_state.get("done_stages", [])
-    active = st.session_state.get("active_stage", None)
-
+    done = st.session_state.get("done_stages",[])
+    active = st.session_state.get("active_stage",None)
     cols = st.columns(4)
-    for i, (sid, label) in enumerate(stages):
+    for i, (sid, label) in enumerate(zip(stage_ids, stages)):
         with cols[i % 4]:
             if sid in done:
                 st.success(label)
             elif sid == active:
-                st.info(label + " ...")
+                st.info(label + "...")
             else:
                 st.markdown("<span style='color:#999;font-size:13px'>" + label + "</span>", unsafe_allow_html=True)
 
@@ -439,10 +489,11 @@ def main():
         st.session_state["pipeline_results"] = None
         st.session_state["excel_bytes"] = None
 
-        try:
-            def mark(sid):
-                st.session_state["done_stages"] = st.session_state.get("done_stages", []) + [sid]
+        def mark(sid):
+            current = st.session_state.get("done_stages",[])
+            st.session_state["done_stages"] = current + [sid]
 
+        try:
             st.session_state["active_stage"] = "discover"
             jobs1 = stage_discover(ak, ck, status_area)
             mark("discover")
@@ -451,7 +502,7 @@ def main():
             st.session_state["active_stage"] = "score"
             jobs2 = stage_score(jobs1, resume, ck, status_area)
             mark("score")
-            status_area.success(str(len(jobs2)) + " strong matches found")
+            status_area.success(str(len(jobs2)) + " strong matches (score 7.5+)")
 
             st.session_state["active_stage"] = "contacts"
             jobs3 = stage_contacts(jobs2, ak, ck, status_area)
@@ -470,7 +521,7 @@ def main():
             mark("resume")
 
             st.session_state["active_stage"] = "export"
-            status_area.info("Generating spreadsheet...")
+            status_area.info("Stage 7/7: Generating spreadsheet...")
             jobs6 = [deep_clean(j) for j in jobs6]
             excel_bytes = generate_excel(jobs6)
             mark("export")
@@ -479,54 +530,65 @@ def main():
             st.session_state["pipeline_results"] = jobs6
             st.session_state["excel_bytes"] = excel_bytes
 
-            email_total = sum(1 for j in jobs6 for c in j.get("contacts", []) if c.get("email"))
-            status_area.success("Pipeline complete! " + str(len(jobs6)) + " jobs matched. " + str(email_total) + " direct emails found. Download button is in the sidebar.")
+            email_total = sum(1 for j in jobs6 for c in j.get("contacts",[]) if c.get("email"))
+            status_area.success(
+                "Pipeline complete! " + str(len(jobs6)) + " jobs matched. " +
+                str(email_total) + " direct emails found. Download button is in the sidebar."
+            )
             st.balloons()
 
         except Exception as e:
-            status_area.error("Pipeline error: " + str(e))
+            current_stage = st.session_state.get("active_stage","unknown")
+            status_area.error("Pipeline error at stage [" + str(current_stage) + "]: " + str(e))
             st.session_state["active_stage"] = None
 
     results = st.session_state.get("pipeline_results")
     if results:
         st.divider()
-        email_total = sum(1 for j in results for c in j.get("contacts", []) if c.get("email"))
+        email_total = sum(1 for j in results for c in j.get("contacts",[]) if c.get("email"))
         st.subheader(str(len(results)) + " Matched Jobs · " + str(email_total) + " Direct Emails Found")
 
-        tabs = st.tabs([j.get("company","") + " (" + str(round(j.get("score",0),1)) + ")" for j in results])
+        tab_labels = [j.get("company","?") + " (" + str(round(j.get("score",0),1)) + ")" for j in results]
+        tabs = st.tabs(tab_labels)
+
         for tab, job in zip(tabs, results):
             with tab:
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Match Score", str(round(job.get("score",0),1)) + "/10")
-                col2.metric("Competition", str(job.get("competition","")).capitalize())
-                col3.metric("Sponsorship", str(job.get("sponsorship","")).capitalize())
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Match Score", str(round(job.get("score",0),1)) + "/10")
+                c2.metric("Competition", str(job.get("competition","")).capitalize())
+                c3.metric("Sponsorship", str(job.get("sponsorship","")).capitalize())
 
                 if job.get("url"):
                     st.markdown("[Apply Now](" + job["url"] + ")")
                 if job.get("match_reason"):
                     st.success("Why you match: " + job["match_reason"])
-                if job.get("gap") and job["gap"].lower() not in ("none",""):
-                    st.warning("Address in cover note: " + job["gap"])
-
+                if job.get("gap") and str(job["gap"]).lower() not in ("none",""):
+                    st.warning("Address in cover note: " + str(job["gap"]))
                 if job.get("resume_tailor_prompt"):
-                    with st.expander("Resume Tailor Prompt — Copy and paste into your Resume Tailor project"):
-                        st.text_area("", value=job["resume_tailor_prompt"], height=200, key="rtp_" + job.get("company","") + str(results.index(job)), label_visibility="collapsed")
+                    with st.expander("Resume Tailor Prompt - copy and paste into your Resume Tailor project"):
+                        st.text_area("", value=job["resume_tailor_prompt"], height=200,
+                            key="rtp_" + str(results.index(job)),
+                            label_visibility="collapsed")
 
                 st.subheader("Decision Makers (" + str(len(job.get("contacts",[]))) + ")")
-                for ci, contact in enumerate(job.get("contacts", [])):
-                    priority = contact.get("priority","")
-                    icon = "🌟" if priority == "high" else "🔵" if priority == "medium" else "⚪"
-                    label = icon + " " + contact.get("name","") + " — " + contact.get("title","")
+                for ci, contact in enumerate(job.get("contacts",[])):
+                    priority = str(contact.get("priority",""))
+                    icon = "🌟" if priority == "high" else "🔵" if priority == "medium" else "o"
+                    label = icon + " " + str(contact.get("name","")) + " - " + str(contact.get("title",""))
                     with st.expander(label):
                         if contact.get("email"):
-                            st.markdown("**Direct Email:** `" + contact["email"] + "` (" + str(contact.get("email_score","")) + "% confidence" + (" · Verified" if contact.get("email_verified") else "") + ")")
+                            score_str = str(contact.get("email_score",""))
+                            verified_str = " Verified" if contact.get("email_verified") else ""
+                            st.markdown("**Direct Email:** `" + contact["email"] + "` (" + score_str + "% confidence" + verified_str + ")")
                         else:
-                            st.caption("Email not found — use LinkedIn")
+                            st.caption("Email not found - use LinkedIn")
                         if contact.get("linkedInUrl"):
-                            st.markdown("[LinkedIn Profile](" + contact["linkedInUrl"] + ")")
+                            st.markdown("[LinkedIn Profile](" + str(contact["linkedInUrl"]) + ")")
                         if contact.get("email_draft"):
                             st.markdown("**Outreach Email Draft:**")
-                            st.text_area("", value=contact["email_draft"], height=120, key="draft_" + job.get("company","") + str(ci), label_visibility="collapsed")
+                            st.text_area("", value=str(contact["email_draft"]), height=120,
+                                key="draft_" + str(results.index(job)) + "_" + str(ci),
+                                label_visibility="collapsed")
 
 if __name__ == "__main__":
     main()

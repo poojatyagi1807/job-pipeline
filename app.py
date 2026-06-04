@@ -9,6 +9,35 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 import os
 
+# ── Text sanitizer ────────────────────────────────────────────────
+def clean(text):
+    """Remove non-ASCII and problematic Unicode characters from text."""
+    if not text:
+        return ""
+    if not isinstance(text, str):
+        text = str(text)
+    # Replace common problematic unicode chars
+    replacements = {
+        ' ': ' ',  # Line separator
+        ' ': ' ',  # Paragraph separator
+        '​': '',   # Zero width space
+        '‌': '',   # Zero width non-joiner
+        '‍': '',   # Zero width joiner
+        '﻿': '',   # BOM
+        ' ': ' ',  # Non-breaking space
+        '–': '-',  # En dash
+        '—': '-',  # Em dash
+        '‘': "'",  # Left single quote
+        '’': "'",  # Right single quote
+        '“': '"',  # Left double quote
+        '”': '"',  # Right double quote
+        '…': '...', # Ellipsis
+    }
+    for char, replacement in replacements.items():
+        text = text.replace(char, replacement)
+    # Final fallback: encode to ASCII ignoring errors
+    return text.encode('ascii', 'ignore').decode('ascii')
+
 # ── Page config ────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Daily Job Pipeline",
@@ -347,11 +376,11 @@ def generate_excel(jobs: list) -> bytes:
 
     for i, job in enumerate(jobs):
         ws1.append([
-            today, i+1, job.get("company",""), job.get("title",""),
+            today, i+1, clean(job.get("company","")), clean(job.get("title","")),
             job.get("score",""), job.get("domain",""), job.get("seniority",""),
             job.get("technical",""), job.get("ai_relevance",""),
-            job.get("url",""), job.get("competition",""), job.get("sponsorship",""),
-            job.get("match_reason",""), job.get("gap",""), job.get("angle",""),
+            clean(job.get("url","")), clean(job.get("competition","")), clean(job.get("sponsorship","")),
+            clean(job.get("match_reason","")), clean(job.get("gap","")), clean(job.get("angle","")),
             "Not Applied", ""
         ])
 
@@ -368,14 +397,14 @@ def generate_excel(jobs: list) -> bytes:
     for job in jobs:
         for contact in job.get("contacts", []):
             ws2.append([
-                today, job.get("company",""), job.get("title",""),
-                contact.get("name",""), contact.get("title",""),
-                contact.get("email","Not found"),
+                today, clean(job.get("company","")), clean(job.get("title","")),
+                clean(contact.get("name","")), clean(contact.get("title","")),
+                clean(contact.get("email","Not found")),
                 f'{contact.get("email_score","")}%' if contact.get("email_score") else "",
                 "Yes" if contact.get("email_verified") else "",
-                contact.get("linkedInUrl",""),
-                contact.get("priority",""),
-                contact.get("email_draft",""),
+                clean(contact.get("linkedInUrl","")),
+                clean(contact.get("priority","")),
+                clean(contact.get("email_draft","")),
                 "No"
             ])
 
@@ -388,7 +417,7 @@ def generate_excel(jobs: list) -> bytes:
         cell.fill = PatternFill("solid", fgColor="1a73e8")
 
     for job in jobs:
-        ws3.append([job.get("company",""), job.get("title",""), job.get("resume_tailor_prompt","")])
+        ws3.append([clean(job.get("company","")), clean(job.get("title","")), clean(job.get("resume_tailor_prompt",""))])
 
     # Column widths
     for ws in [ws1, ws2, ws3]:
